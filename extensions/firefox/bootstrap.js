@@ -1,5 +1,3 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 /* Copyright 2012 Mozilla Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,19 +12,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/* globals Components, Services, dump, XPCOMUtils, PdfStreamConverter,
+           APP_SHUTDOWN, PdfjsChromeUtils, PdfjsContentUtils */
 
-'use strict';
+"use strict";
 
-const RESOURCE_NAME = 'pdf.js';
-const EXT_PREFIX = 'extensions.uriloader@pdf.js';
+const RESOURCE_NAME = "pdf.js";
+const EXT_PREFIX = "extensions.uriloader@pdf.js";
 
-let Cc = Components.classes;
-let Ci = Components.interfaces;
-let Cm = Components.manager;
-let Cu = Components.utils;
+const Cc = Components.classes;
+const Ci = Components.interfaces;
+const Cm = Components.manager;
+const Cu = Components.utils;
+const Cr = Components.results;
 
-Cu.import('resource://gre/modules/XPCOMUtils.jsm');
-Cu.import('resource://gre/modules/Services.jsm');
+Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+Cu.import("resource://gre/modules/Services.jsm");
 
 function getBoolPref(pref, def) {
   try {
@@ -36,21 +37,42 @@ function getBoolPref(pref, def) {
   }
 }
 
-function setStringPref(pref, value) {
-  let str = Cc['@mozilla.org/supports-string;1']
-              .createInstance(Ci.nsISupportsString);
-  str.data = value;
-  Services.prefs.setComplexValue(pref, Ci.nsISupportsString, str);
-}
-
 function log(str) {
-  if (!getBoolPref(EXT_PREFIX + '.pdfBugEnabled', false))
+  if (!getBoolPref(EXT_PREFIX + ".pdfBugEnabled", false)) {
     return;
-  dump(str + '\n');
+  }
+  dump(str + "\n");
 }
 
-// Register/unregister a constructor as a component.
-let Factory = {
+function initializeDefaultPreferences() {
+  var DEFAULT_PREFERENCES =
+//#include ../../web/default_preferences.json
+//#if false
+    "end of DEFAULT_PREFERENCES";
+//#endif
+
+  var defaultBranch = Services.prefs.getDefaultBranch(EXT_PREFIX + ".");
+  var defaultValue;
+  for (var key in DEFAULT_PREFERENCES) {
+    defaultValue = DEFAULT_PREFERENCES[key];
+    switch (typeof defaultValue) {
+      case "boolean":
+        defaultBranch.setBoolPref(key, defaultValue);
+        break;
+      case "number":
+        defaultBranch.setIntPref(key, defaultValue);
+        break;
+      case "string":
+        defaultBranch.setCharPref(key, defaultValue);
+        break;
+    }
+  }
+}
+
+// Factory that registers/unregisters a constructor as a component.
+function Factory() {}
+
+Factory.prototype = {
   QueryInterface: XPCOMUtils.generateQI([Ci.nsIFactory]),
   _targetConstructor: null,
 
@@ -60,20 +82,30 @@ let Factory = {
     var registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
     registrar.registerFactory(proto.classID, proto.classDescription,
                               proto.contractID, this);
+
+    if (proto.classID2) {
+      this._classID2 = proto.classID2;
+      registrar.registerFactory(proto.classID2, proto.classDescription,
+                                proto.contractID2, this);
+    }
   },
 
   unregister: function unregister() {
     var proto = this._targetConstructor.prototype;
     var registrar = Cm.QueryInterface(Ci.nsIComponentRegistrar);
     registrar.unregisterFactory(proto.classID, this);
+    if (this._classID2) {
+      registrar.unregisterFactory(this._classID2, this);
+    }
     this._targetConstructor = null;
   },
 
   // nsIFactory
   createInstance: function createInstance(aOuter, iid) {
-    if (aOuter !== null)
+    if (aOuter !== null) {
       throw Cr.NS_ERROR_NO_AGGREGATION;
-    return (new (this._targetConstructor)).QueryInterface(iid);
+    }
+    return (new (this._targetConstructor)()).QueryInterface(iid);
   },
 
   // nsIFactory
@@ -83,7 +115,9 @@ let Factory = {
   }
 };
 
-let pdfStreamConverterUrl = null;
+var pdfStreamConverterFactory = new Factory();
+var pdfBaseUrl = null;
+var e10sEnabled = false;
 
 // As of Firefox 13 bootstrapped add-ons don't support automatic registering and
 // unregistering of resource urls and components/contracts. Until then we do
@@ -92,37 +126,67 @@ let pdfStreamConverterUrl = null;
 function startup(aData, aReason) {
   // Setup the resource url.
   var ioService = Services.io;
-  var resProt = ioService.getProtocolHandler('resource')
+  var resProt = ioService.getProtocolHandler("resource")
                   .QueryInterface(Ci.nsIResProtocolHandler);
-  var aliasURI = ioService.newURI('content/', 'UTF-8', aData.resourceURI);
+  var aliasURI = ioService.newURI("content/", "UTF-8", aData.resourceURI);
   resProt.setSubstitution(RESOURCE_NAME, aliasURI);
 
+  pdfBaseUrl = aData.resourceURI.spec;
+
+  Cu.import(pdfBaseUrl + "content/PdfjsChromeUtils.jsm");
+  PdfjsChromeUtils.init();
+  Cu.import(pdfBaseUrl + "content/PdfjsContentUtils.jsm");
+  PdfjsContentUtils.init();
+
   // Load the component and register it.
-  pdfStreamConverterUrl = aData.resourceURI.spec +
-                          'components/PdfStreamConverter.js';
+  var pdfStreamConverterUrl = pdfBaseUrl + "content/PdfStreamConverter.jsm";
   Cu.import(pdfStreamConverterUrl);
-  Factory.register(PdfStreamConverter);
+  pdfStreamConverterFactory.register(PdfStreamConverter);
+
+  try {
+    let globalMM = Cc["@mozilla.org/globalmessagemanager;1"]
+                     .getService(Ci.nsIFrameScriptLoader);
+    globalMM.loadFrameScript("chrome://pdf.js/content/content.js", true);
+    e10sEnabled = true;
+  } catch (ex) {
+  }
+
+  initializeDefaultPreferences();
 }
 
 function shutdown(aData, aReason) {
-  if (aReason == APP_SHUTDOWN)
+  if (aReason === APP_SHUTDOWN) {
     return;
+  }
+
+  if (e10sEnabled) {
+    let globalMM = Cc["@mozilla.org/globalmessagemanager;1"]
+                     .getService(Ci.nsIMessageBroadcaster);
+    globalMM.broadcastAsyncMessage("PDFJS:Child:shutdown");
+    globalMM.removeDelayedFrameScript("chrome://pdf.js/content/content.js");
+  }
+
   var ioService = Services.io;
-  var resProt = ioService.getProtocolHandler('resource')
+  var resProt = ioService.getProtocolHandler("resource")
                   .QueryInterface(Ci.nsIResProtocolHandler);
   // Remove the resource url.
   resProt.setSubstitution(RESOURCE_NAME, null);
   // Remove the contract/component.
-  Factory.unregister();
+  pdfStreamConverterFactory.unregister();
   // Unload the converter
+  var pdfStreamConverterUrl = pdfBaseUrl + "content/PdfStreamConverter.jsm";
   Cu.unload(pdfStreamConverterUrl);
-  pdfStreamConverterUrl = null;
+
+  PdfjsContentUtils.uninit();
+  Cu.unload(pdfBaseUrl + "content/PdfjsContentUtils.jsm");
+  PdfjsChromeUtils.uninit();
+  Cu.unload(pdfBaseUrl + "content/PdfjsChromeUtils.jsm");
 }
 
 function install(aData, aReason) {
+  // TODO remove after some time -- cleanup of unused preferences
+  Services.prefs.clearUserPref(EXT_PREFIX + ".database");
 }
 
 function uninstall(aData, aReason) {
-  setStringPref(EXT_PREFIX + '.database', '{}');
 }
-
